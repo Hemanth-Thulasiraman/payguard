@@ -1,0 +1,15 @@
+venv/
+.env
+data/raw/*
+data/processed/*
+data/validation_reports/*
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+!data/validation_reports/.gitkeep
+models/*
+!models/.gitkeep
+mlruns/
+mlflow.db
+__pycache__/
+*.py[cod]
+.DS_Store
