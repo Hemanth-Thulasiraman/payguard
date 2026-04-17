@@ -1,5 +1,6 @@
 # src/data/preprocess.py
 
+import json
 import numpy as np
 import pandas as pd
 from loguru import logger
@@ -23,12 +24,11 @@ def drop_high_null_features(
 ) -> pd.DataFrame:
     """
     Drops features where null rate exceeds threshold.
-    These features have too few values to learn from reliably.
+    Never drops target or key columns.
     """
     null_rates = df.isnull().mean()
     cols_to_drop = null_rates[null_rates > threshold].index.tolist()
 
-    # Never drop target or key columns
     protected = ["isFraud", "TransactionID", "TransactionDT"]
     cols_to_drop = [c for c in cols_to_drop if c not in protected]
 
@@ -44,42 +44,52 @@ def drop_high_null_features(
 def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     """
     Engineers new features from TransactionDT and TransactionAmt.
-    TransactionDT is seconds elapsed — we extract time components.
+    TransactionDT is seconds elapsed from a reference point.
     """
-    logger.info("Engineering features from TransactionDT and TransactionAmt...")
+    logger.info("Engineering features...")
 
-    # Time features — TransactionDT is seconds from a reference point
     df["hour"] = (df["TransactionDT"] / 3600) % 24
     df["day_of_week"] = (df["TransactionDT"] / 86400) % 7
     df["day_of_month"] = (df["TransactionDT"] / 86400) % 30
 
-    # Amount features
     df["amount_log"] = np.log1p(df["TransactionAmt"])
-    df["amount_cents"] = df["TransactionAmt"] % 1  # cents portion
-    df["is_round_amount"] = (df["TransactionAmt"] % 1 == 0).astype(int)
+    df["amount_cents"] = df["TransactionAmt"] % 1
+    df["is_round_amount"] = (
+        df["TransactionAmt"] % 1 == 0
+    ).astype(int)
 
-    # Card features — card1 and card2 are numerical card identifiers
     if "card1" in df.columns and "card2" in df.columns:
-        df["card1_card2"] = df["card1"].astype(str) + "_" + df["card2"].astype(str)
+        df["card1_card2"] = (
+            df["card1"].astype(str) + "_" + df["card2"].astype(str)
+        )
+        CATEGORICAL_COLS.append("card1_card2")
 
     logger.info(f"Engineered 7 new features")
     logger.info(f"Total features after engineering: {df.shape[1]}")
     return df
 
 
-def encode_categoricals(df: pd.DataFrame) -> pd.DataFrame:
+def encode_categoricals(
+    df: pd.DataFrame,
+) -> tuple[pd.DataFrame, dict]:
     """
-    Encodes categorical columns as pandas category dtype.
-    LightGBM handles category dtype natively and efficiently.
-    Fills nulls with 'unknown' before encoding.
+    Encodes categorical columns as integer codes.
+    Saves mapping dict so inference uses identical codes.
+    Returns DataFrame and mapping dict.
     """
     existing_cats = [c for c in CATEGORICAL_COLS if c in df.columns]
     logger.info(f"Encoding {len(existing_cats)} categorical columns")
 
+    mappings = {}
     for col in existing_cats:
-        df[col] = df[col].fillna("unknown").astype("category")
+        df[col] = df[col].fillna("unknown").astype(str)
+        categories = sorted(df[col].unique().tolist())
+        mapping = {cat: idx for idx, cat in enumerate(categories)}
+        mappings[col] = mapping
+        df[col] = df[col].map(mapping).fillna(-1).astype(int)
 
-    return df
+    logger.info(f"Category mappings created for {len(mappings)} columns")
+    return df, mappings
 
 
 def temporal_split(
@@ -89,12 +99,8 @@ def temporal_split(
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
     Splits dataset by time — not randomly.
-    Train: first 70% of time period
-    Val:   next 15% of time period
-    Test:  last 15% of time period
-
+    Train: first 70%, Val: next 15%, Test: last 15%.
     Critical: never shuffle before splitting.
-    Random splits cause temporal leakage.
     """
     df = df.sort_values("TransactionDT").reset_index(drop=True)
 
@@ -127,7 +133,8 @@ def run_preprocessing() -> None:
     """
     Main entry point for preprocessing pipeline.
     Loads merged data, cleans, engineers features,
-    splits temporally, saves to processed/.
+    encodes categoricals, splits temporally, saves splits.
+    Also saves category mappings for serving layer.
     """
     logger.info("=" * 50)
     logger.info("Starting PayGuard preprocessing")
@@ -138,11 +145,17 @@ def run_preprocessing() -> None:
 
     df = drop_high_null_features(df)
     df = engineer_features(df)
-    df = encode_categoricals(df)
+    df, mappings = encode_categoricals(df)
+
+    # Save category mappings for serving layer
+    PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+    mappings_path = PROCESSED_DIR / "category_mappings.json"
+    with open(mappings_path, "w") as f:
+        json.dump(mappings, f, indent=2)
+    logger.info(f"Category mappings saved to {mappings_path}")
 
     train, val, test = temporal_split(df)
 
-    PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
     train.to_parquet(PROCESSED_DIR / "train.parquet", index=False)
     val.to_parquet(PROCESSED_DIR / "val.parquet", index=False)
     test.to_parquet(PROCESSED_DIR / "test.parquet", index=False)
